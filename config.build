@@ -1,0 +1,45 @@
+[build]
+	server = http://<jenkins server url:port>
+	project = <project name>
+	notification = <subscribers email list>
+
+[jobs]
+	jobname = BuildJob1
+	jobname = BuildJob2
+    ...
+    jobname = RunTestsOnTags
+	jobname = StaticAnalysis
+
+[BuildJob1]
+	jenkinsJobName = <Job Name>
+	subProject = <Sub Project Name>
+	authToken = <Auth key>
+	filter = <path/to/dir/to/build 1>
+	filter = <path/to/dir/to/build 2>
+	ignoreGroup = BuildIgnore
+
+[BuildJob2]
+    jenkinsJobName = <Job Name>
+    subProject = <Sub Project Name>
+    authToken = <Auth key>
+    filter = <path/to/dir/to/build 1>
+    filter = <path/to/dir/to/build 3>
+    ignoreGroup = BuildIgnore
+	extraParamsFile = config.build.exta_params.txt
+
+[RunTestsOnTags]
+	jenkinsJobName = <Job name, i.e. Build_Per_Tag>
+	subProject = <Sub Project Name>
+	authToken = <Auth key>
+	onlyOnTag = true
+
+[StaticAnalysis]
+	jenkinsJobName = <Run static analysis Job Name>
+    subProject = <Sub Project Name>
+    authToken = <Auth key>
+	ignoreGroup = BuildIgnore
+
+[BuildIgnore]
+	ignore = version.h
+    ignore = config.build
+

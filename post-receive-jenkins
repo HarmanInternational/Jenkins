@@ -1,0 +1,356 @@
+#!/bin/bash
+# git hook: post-receive-jenkins
+
+
+build_config_onrepo=config.build
+build_config=$(mktemp /tmp/build.config.XXXXXX)
+trigger_util=curl
+trigger_params="--insecure --max-time 5 --connect-timeout 7 -w %{http_code} -S -s -o /dev/null"
+
+get_config_property()
+{
+    if [ $# -lt 2 ]; then
+	return 1
+    fi
+	
+    echo $(git config -f $build_config --$1 $2)
+    return 0
+}
+
+urlencode()
+{
+    encoded=$(echo "$1" | sed -e 's:\%:%25:g' \
+	-e 's:\ :%20:g' \
+	-e 's:<:%3C:g' \
+	-e 's:>:%3E:g' \
+	-e 's:#:%23:g' \
+	-e 's:{:%7B:g' \
+	-e 's:}:%7D:g' \
+	-e 's:|:%7C:g' \
+	-e 's:\\:%5C:g' \
+	-e 's:\^:%5E:g' \
+	-e 's:~:%7E:g' \
+	-e 's:\[:%5B:g' \
+	-e 's:\]:%5D:g' \
+	-e 's:`:%60:g' \
+	-e 's:;:%3B:g' \
+	-e 's:?:%3F:g' \
+	-e 's^:^%3A^g' \
+	-e 's:@:%40:g' \
+	-e 's:=:%3D:g' \
+	-e 's:\$:%24:g' \
+	-e 's:\!:%21:g' \
+	-e 's:\*:%2A:g' \
+	)
+    echo $encoded
+}
+
+prep_for_build()
+{
+	# --- Arguments
+	oldrev=$(git rev-parse $1)
+	newrev=$(git rev-parse $2)
+	refname="$3"
+
+	# --- Interpret
+	# 0000->1234 (create)
+	# 1234->2345 (update)
+	# 2345->0000 (delete)
+	if expr "$oldrev" : '0*$' >/dev/null ; then
+	    change_type="create"
+	else
+	    if expr "$newrev" : '0*$' >/dev/null ; then
+		change_type="delete"
+	    else
+		change_type="update"
+	    fi
+	fi
+
+	# --- Get the revision types
+	newrev_type=$(git cat-file -t "$newrev" 2> /dev/null)
+	oldrev_type=$(git cat-file -t "$oldrev" 2> /dev/null)
+	case "$change_type" in
+	create|update)
+		rev="$newrev"
+		rev_type="$newrev_type"
+		;;
+	delete)
+		rev="$oldrev"
+		rev_type="$oldrev_type"
+		;;
+	esac
+
+	# The revision type tells us what type the commit is, combined with
+	# the location of the ref we can decide between
+	#  - working branch
+	#  - tracking branch
+	#  - unannoted tag
+	#  - annotated tag
+	case "$refname","$rev_type" in
+		refs/tags/*,commit)
+			# un-annotated tag
+			refname_type="tag"
+			short_refname=${refname##refs/tags/}
+			;;
+		refs/tags/*,tag)
+			# annotated tag
+			refname_type="annotated tag"
+			short_refname=${refname##refs/tags/}
+			;;
+		refs/heads/*,commit)
+			# branch
+			refname_type="branch"
+			short_refname=${refname##refs/heads/}
+			;;
+		refs/remotes/*,commit)
+			# tracking branch
+			refname_type="tracking branch"
+			short_refname=${refname##refs/remotes/}
+			;;
+		*)
+			# Anything else (is there anything else?)
+			echo >&2 "*** Unknown type of update to $refname ($rev_type)"
+			echo >&2 "***  - not triggering any job"
+			return 1
+			;;
+	esac
+
+	# Check if notification configuration file exists
+	git cat-file -e $newrev:$build_config_onrepo 2>/dev/null
+	if [ $? -ne 0 ]; then
+		return 1 # Do not trigger any jobs
+	fi
+
+	git show $newrev:$build_config_onrepo > $build_config
+	return 0
+}
+
+
+collect_file_filters()
+{
+    if [ $# -lt 1 ]; then
+	return 1
+    fi
+    
+    unset -v files_to_notify
+    unset -v files_in_push
+    job="$1"
+
+    # Collect all files that are part of this push
+    files_in_push=($(git diff-tree --no-commit-id --name-only -r $oldrev..$newrev))
+
+    # If no filter parameter is given for a job, trigger build for every push
+    filter_list=$(get_config_property get-all $job.filter)
+    groups_list=$(get_config_property get-all $job.filterGroup)
+    if [ -z "$filter_list" -a -z "$groups_list" ]; then
+	echo "${files_in_push[@]}"
+	return 0
+    fi
+    
+    # Collect all files that this job is registered to
+    for filter in $filter_list; do
+	files_to_notify=( ${files_to_notify[*]} $(git diff-tree --no-commit-id \
+	    --name-only -r $oldrev..$newrev | grep -e ^$filter) )
+    done
+
+    # Collect also file defined as part of file's list
+    for group in $groups_list; do
+	for filter in $(get_config_property get-all $group.filter); do
+	    files_to_notify=( ${files_to_notify[*]} $(git diff-tree --no-commit-id \
+		--name-only -r $rev | grep -e ^$filter) )
+	done
+    done
+
+    echo "$files_to_notify"
+    return 0
+}
+
+remove_ignored_files()
+{
+    if [ $# -lt 2 ]; then
+	return 1
+    fi
+
+    unset -v files_to_notify
+    job="$1"
+    shift 1
+    files_to_notify=$@
+
+    # files_to_notify is an empty list, so nothing to do
+    if [ -z "$files_to_notify" -o "${#files_to_notify}" -eq 0 ]; then
+	echo "${files_to_notify[@]}"
+	return 0
+    fi
+
+    shopt -s extglob
+    # Removing files in ignore list from push list
+    ignore_list=$(get_config_property get-all $job.ignore)    
+    for ignore in $ignore_list; do
+	files_to_notify=( ${files_to_notify[@]%%$ignore} )
+    done
+
+    # Collect also files defined as part of ignore group
+    ignore_groups_list=$(get_config_property get-all $job.ignoreGroup)
+    for group in $ignore_groups_list; do
+	for ignore in $(get_config_property get-all $group.ignore); do
+	    files_to_notify=( ${files_to_notify[@]%%$ignore} )
+	done
+    done
+
+    echo "${files_to_notify[@]}"
+    return 0
+}
+
+
+parse_extra_params()
+{
+    extra_params=""
+
+    if [ -z "$1" ]; then
+	echo ""
+	return 1
+    fi
+    filename="$1"
+    
+    # Check if extra params file exists
+    git cat-file -e $newrev:$filename 2>/dev/null
+    if [ $? -ne 0 ]; then
+	echo ""
+	return 1
+    fi
+
+    temp_file=$(mktemp)
+    git show $newrev:$filename > $temp_file
+    while read line
+    do
+		# Trim line
+        line="${line#"${line%%[![:space:]]*}"}"
+		# Ignore comments or empty lines
+        if [[ $line =~ ^\#.* ]] || [[ -z $line ]]
+        then
+            continue
+        fi	
+
+	param="$(echo ${line%%=*} | tr -d '[:space:]')"	
+    value="$(echo ${line#*=}  | tr -d '[:space:]')"
+	extra_params="$extra_params --data-urlencode $param=$value"
+    done < $temp_file
+    rm $temp_file
+
+    echo $extra_params
+    return 0
+}
+
+trigger_build()
+{
+    server_url=$(get_config_property get build.server)
+    project=$(get_config_property get build.project)
+    notification_list=$(get_config_property get build.notification)
+   
+    # Trigger build for each job in jobs list
+    for job in $(get_config_property get-all jobs.jobname); do
+
+	# Some Jobs should be triggered only when pushing tags
+	build_only_for_tags=$(get_config_property "get --bool" $job.onlyOnTag)
+	if [ "$refname_type" = "tag" ]; then
+	    # if tag skip jobs where onlyOnTag is not defined or not true
+	    if [ -z "$build_only_for_tags" -o "$build_only_for_tags" != "true" ]; then
+		continue
+	    fi
+	else
+	    # if not tag, skip jobs where onlyOnTag is true
+	    if [ -n "$build_only_for_tags" -a "$build_only_for_tags" = "true" ]; then
+		continue
+	    fi	    
+	fi
+
+	# Trigger build only if Authentecation Token is defined
+	auth_token=$(get_config_property get $job.authToken)
+	if [ -z "$auth_token" ]; then
+	    echo "Error, authentication token is not defined for $job, aborting build"
+	    continue
+	fi
+
+	# Job notification list overrides global list
+	job_notification_list=$(get_config_property get $job.notification)
+	if [ ! -z "$job_notification_list" ]; then
+	    $notification_list=$job_notification_list
+	fi
+
+	# Trigger build only if :
+	# 1. no filters exist or 
+	# 2. filter exist in commit
+	if [ "$refname_type" != "tag" ]; then
+	    trigger_for_files=$(collect_file_filters "$job")
+	    trigger_for_files=$(remove_ignored_files "$job" "$trigger_for_files")
+	    if [ "$refname_type" = "branch" -a -z "$trigger_for_files" ]; then 
+		continue
+	    fi
+	fi
+	
+	job_name=$(get_config_property get $job.jenkinsJobName)
+	sub_project=$(get_config_property get $job.subProject)
+	jenkins_url="$server_url/view/$(urlencode "$project")/view/$(urlencode "$sub_project")/job/$(urlencode "$job_name")"
+	
+	branch=$short_refname
+	author_email=$(git show -s --format="%aE" $rev)
+	author_name=$(git show -s --format="%aN" $rev)
+	notification_list="$notification_list $author_email"
+	cause="Build triggered by $author_name"
+	extra_params_file=$(get_config_property get $job.extraParamsFile)
+	if [ -n "$extra_params_file" ]; then
+	    extra_params=$(parse_extra_params $extra_params_file)
+	    if [ $? -ne 0 ]; then
+		echo "Error Parsing $extra_params_file, ignoring"
+		extra_params=""
+	    fi
+	fi
+
+	echo "Starting Jenkins Job $job_name for $branch"
+	res=$($trigger_util $trigger_params \
+	    --data-urlencode "cause=\"${cause}\"" \
+	    --data-urlencode "token=${auth_token}" \
+	    --data-urlencode "BRANCH=${branch}" \
+	    $extra_params \
+	    "${jenkins_url}/buildWithParameters")
+	if [ $res -ne 200 -a $res -ne 302 -a $res -ne 000 ]; then
+	    msg="Could not trigger build for $job_name, $res"
+	    echo $msg
+	    if [ ! -z "$notification_list" ]; then
+			mail -s "[Jenkins] Git Trigger error, $job_name" $notification_list <<EOF
+$msg
+
+Job: $job_name
+Branch: ${branch}
+Parameters: $extra_params
+Full command:
+$trigger_util $trigger_params \
+	    --data-urlencode "cause=\"${cause}\"" \
+	    --data-urlencode "token=${auth_token}" \
+	    --data-urlencode "BRANCH=${branch}" \
+	    $extra_params \
+	    "${jenkins_url}/buildWithParameters"
+
+EOF
+		fi
+	fi
+	sleep 2
+    done
+	    
+}
+
+#### Main
+
+# Allow dual mode: run from the command line just like the update hook, or
+# if no arguments are given then run as a hook script
+if [ -n "$1" -a -n "$2" -a -n "$3" ]; then
+	prep_for_build $1 $2 $3 && PAGER= trigger_build
+else
+	while read oldrev newrev refname
+	do
+	    prep_for_build $oldrev $newrev $refname || continue
+	    trigger_build 
+	done
+fi
+
+# vim:foldmethod=marker ts=2 ft=sh ai expandtab sw=2
